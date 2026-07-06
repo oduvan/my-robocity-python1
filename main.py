@@ -24,8 +24,6 @@ free):
    simply top up and stand by at the Base.
 """
 
-import math
-
 from simcode import buildings, on, robots, world
 
 WANT = ("ore", "metal")        # one mine of each resource type
@@ -43,7 +41,8 @@ DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (-1, -1), (1, -1)]
 
 
 def _euclid(a, b):
-    return math.hypot(a[0] - b[0], a[1] - b[1])
+    dx, dy = a[0] - b[0], a[1] - b[1]
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def _has_kit(inv):
