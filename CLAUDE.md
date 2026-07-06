@@ -53,35 +53,47 @@ push after a local run looks right. See that repo's `CLAUDE.md` for full usage.
 
 ## The game you're playing (Robot City Builder)
 
-Goal of the reference module: **grow the city**. The loop the starter implements:
+Goal of the reference module: **raise the Base's level**. The Base sets a **quest** (an amount
+of ore + metal); deliver it and the Base **levels up** to a harder quest — endlessly. Your
+**highest Base level is your score.** The loop the starter implements:
 
 ```
-fly into the fog (reveal the map) → place a Mining site on a resource spot (world.build) →
-  the mine digs itself → haul its output to the Base → the Base produces more robots →
-  more robots → faster growth (recharge on a Flying Station so robots keep flying)
+pick up a kit from the starting Storage → fly to a resource spot →
+  place a Mining site (world.build) + drop the kit to build it → the mine digs itself →
+  haul its ore/metal to the Base to fill the quest → Base LEVELS UP → repeat, harder
+  (and: build a Flying Station to make more robots; recharge on any pad to keep flying)
 ```
 
+- **Robots start EMPTY.** There's no free kit — a robot carries nothing until it picks
+  something up. Your capital is a **Storage building pre-placed next to the Base**, stocked
+  with **30 ore / 15 metal**; robots `pick_up` from it to get building materials.
 - **The world is endless & continuous.** Robots have **float** `(x, y)` positions and **fly**
   in straight lines from any point to any point, ignoring terrain and each other (no
   pathfinding, multiple robots may share a spot). They interact with a building by their
   **rounded cell** (`r.cell`). Flying **spends energy** (∝ distance); run the battery to zero
   **mid-flight and the robot is destroyed** — its cargo vanishes. Recharge by landing on a
-  **Flying Station** and calling `r.charge()`.
-- **Resources:** `ore` and `metal`, found at finite **spots**. A **Mining building mines
-  autonomously** into its own storage — there is no `mine` command; a robot only **picks up**
-  the output and **hauls** it to the Base/Storage/a build site.
-- **Buildings:** **Base** (pre-placed, one; produces robots from its store — *not* withdrawable),
-  **Mining** (placed on a live spot; auto-mines into cap'd storage), **Storage** (cheap, big
-  buffer), **Flying Station** (robots land and recharge). Every building except the Base is
-  **built autonomously**: place a site with `world.build(type, x, y)`, robots **`drop`**
-  resources to fulfil the recipe, and the site **self-completes** once supplied — no connect
-  step, no robot labor.
-- **Construction recipe (Mining):** 6 ore + 3 metal. The fleet **starts with a couple of
-  robots**, each carrying a 6/3 kit (enough to place one mine) and a **full battery**. Robots
-  the Base produces also arrive with a kit and full battery.
+  **charging pad** (the **Base** or a **Flying Station**) and calling `r.charge()`.
+- **Resources:** `ore` and `metal`, found at finite **spots** (a spot yields one or the other).
+  A **Mining building mines autonomously** into its own storage — there is no `mine` command;
+  a robot only **picks up** the output and **hauls** it away.
+- **Buildings:**
+  - **Base** (pre-placed, one) — the **quest hub** and a **charging pad**. `drop` ore/metal on
+    it to progress the current quest; meet it and it **levels up**. You **cannot** `pick_up`
+    from the Base (its store is the quest accumulator only).
+  - **Storage** (2×2 hub) — a big buffer robots `pick_up` from and `drop` into. The starting
+    one holds your capital; you can build more with `world.build("storage", …)`.
+  - **Mining** — placed on a live resource spot; auto-mines its resource into a small capped
+    store that robots `pick_up` from.
+  - **Flying Station** — a **charging pad** *and* the **robot factory**: stock it (`drop`
+    ore/metal), then call `station.build_robot(n)` to produce robots there.
+- **Everything except the Base is built autonomously:** place a site with
+  `world.build(type, x, y)`, robots **`drop`** resources to fulfil the recipe, and the site
+  **self-completes** once supplied — no connect step, no robot labor.
+- **Recipes:** Mining `6 ore + 3 metal`, Storage `3 ore`, Flying Station `4 ore + 2 metal`; a
+  Flying Station spends `12 ore + 6 metal` from its own store per robot it builds.
 - **Same map for everyone.** The module fixes the world seed, so *every* city of this type
   starts from the **identical canonical map** — the only variable is your code. It's a contest
-  of whose program builds the better city.
+  of whose program climbs to the highest Base level.
 
 ## SDK reference
 
@@ -104,9 +116,11 @@ Each event carries `e.robot_id`. Common events and their extra fields:
 | `spot_depleted` | `building_id` | a Mining building's resource spot ran out (no `robot_id`). |
 | `storage_full` | `building_id` | a building's storage is full (no `robot_id`). |
 | `inventory_full` | — | a robot can't carry more. |
-| `robot_produced` | `robot_id` | the Base finished a new robot. |
+| `robot_produced` | `robot_id` | a **Flying Station** finished a new robot. |
 | `robot_destroyed` | `position`, `reason` | a robot ran out of energy **mid-flight** — gone, cargo lost. |
-| `charge_complete` | — | a robot on a Flying Station finished charging (battery full). |
+| `charge_complete` | — | a robot on a charging pad finished charging (battery full). |
+| `quest_updated` | `level`, `requirements{ore,metal}` | the Base's current quest — at start and after each level-up (`building_id`, no `robot_id`). |
+| `base_level_up` | `level`, `quest{ore,metal}` | the Base cleared its quest and **leveled up** (`building_id`, no `robot_id`). |
 | `message` | `from`, `payload` | another robot messaged this one. |
 
 The cleanest controller is built around **`idle`**: it fires exactly when a robot is free,
@@ -143,13 +157,30 @@ robot's **current (rounded) cell** (`r.cell`). So to haul, `move_to` the mine, `
 and construction are **autonomous**, so there are no robot-driven mining, build-wiring,
 site-placing, or single-step-move commands — robots only fly, haul, and charge.
 
-### Command the Base — `b = buildings.base`
-The Base isn't built or moved; you command it directly to grow the fleet.
+### The Base — the quest hub — `b = buildings.base`
+There's one Base; reach it via `buildings.base`. It **isn't built or commanded** — you feed it
+and read its objective:
+- **Feed it:** robots `drop(ore=…, metal=…)` on the Base's cell. Its store is the **quest
+  accumulator**, capped per-resource at the requirement (excess stays on the robot). You
+  **cannot `pick_up` from the Base.** It also doubles as a **charging pad** (`r.charge()`).
+- **Read the objective:** `buildings.base.level` (current level, starts at 1) and
+  `buildings.base.quest` — `.required` and `.progress`, each `{ore, metal}` (progress =
+  min(delivered, required)). Deliver the required ore+metal and the Base **levels up** to the
+  next, harder quest. Subscribe to `quest_updated` / `base_level_up` to react.
+
+### Grow the fleet — Flying Stations — `buildings.stations()`
+Robots are built at a **Flying Station** (not the Base). Build one with
+`world.build("flying_station", x, y)`, stock it, then command it:
 
 | Call | What it does |
 | --- | --- |
-| `buildings.base.build_robot(n=1)` | Queue `n` new robots. Each consumes `12 ore + 6 metal` from the Base's store and takes time; each finished one fires `robot_produced` and the new robot's first `idle`. Waits if the store is short. |
-| `buildings.base.cancel()` | Clear the pending production queue. |
+| `station.build_robot(n=1)` | Queue `n` robots at **this** station. Each consumes `12 ore + 6 metal` from the station's own store and takes time; each finished one spawns **empty** at the station and fires `robot_produced` + its first `idle`. Waits if the store is short. |
+| `station.cancel()` | Clear this station's production queue. |
+
+Get a station handle from `buildings.stations()` (or `buildings.of_type("flying_station")`);
+each exposes `.storage` (its production store — `drop` ore/metal here to fuel building) and
+`.production` (`.active`, `.progress`, `.queued`). You **cannot `pick_up` from a station** (its
+store is production-only).
 
 ### Read the world (read-only handles)
 You never hold a live object — these read **fresh** state each time your handler runs.
@@ -161,12 +192,15 @@ You never hold a live object — these read **fresh** state each time your handl
   `r.energy` (battery, 0…cap), `r.inventory` (`.ore`, `.metal`, `.free`, `.capacity`,
   `.is_full`), `r.here` (`.terrain`, `.spot`, `.building` — what's on its cell),
   `r.nearest(kind=…|type=…)`, and `r.memory` (a per-robot dict you can write to).
-- **Buildings:** `buildings[id]`, `buildings.all()`, `buildings.of_type(t)`, `buildings.base`.
-  A building handle exposes `.type` (`base`/`mining`/`storage`/`flying_station`), `.position`,
+- **Buildings:** `buildings[id]`, `buildings.all()`, `buildings.of_type(t)`, `buildings.base`,
+  `buildings.stations()`. A building handle exposes `.type`
+  (`base`/`mining`/`storage`/`flying_station`), `.position`, `.footprint` (w, h),
   `.status` (`constructing`/`active`), `.storage` (`.ore`/`.metal`/`.capacity`/`.free`),
   `.spot` (Mining: `.resource`, `.remaining` — the building auto-mines into its storage),
-  `.production` (Base), `.construction` (while building: `.required`, `.delivered`,
-  `.progress` — sites self-complete, so **no `connected` field**).
+  `.level` + `.quest` (Base: `.quest.required` / `.quest.progress`, each `{ore, metal}`),
+  `.production` (Flying Station: `.active`, `.progress`, `.queued`), `.construction` (while
+  building: `.required`, `.delivered`, `.progress` — sites self-complete, so **no `connected`
+  field**).
 - **World:** `world.tick`; `world.size` (bounding box of the **discovered** region — a viewport
   hint, not a fixed extent), `world.origin`, `world.endless` (`True`); `world.spots()` — the
   resource spots you've **discovered so far** (each with `.position`, `.spot.resource`,
@@ -192,11 +226,14 @@ You never hold a live object — these read **fresh** state each time your handl
   better code = a better city.
 - You can't run the engine locally; iterate by reading the logic carefully and by checking the
   live city + logs after a push (or via the platform's MCP tools).
-- High-leverage improvements over the starter: keep the Base fed with **both** ore and metal
-  (it needs both to produce robots), build a **Flying Station** early and recharge robots
-  **before** they run dry (a robot that runs out of energy mid-flight is destroyed and its
-  cargo lost), add **Storage** as a buffer, and call `buildings.base.build_robot(...)`
-  aggressively once resources allow.
+- High-leverage improvements over the starter: bootstrap **both** an ore mine and a metal mine
+  quickly (the quest needs both), keep hauling to the Base to **climb levels**, and when a
+  mine's spot runs dry (`spot_depleted`) build a **replacement** so production never stalls.
+  Recharge robots **before** they run dry (a robot that runs out of energy mid-flight is
+  destroyed and its cargo lost) — build **Flying Stations** near your mining frontier as extra
+  charging pads *and* to grow the fleet with `station.build_robot(...)`. Add **Storage** as a
+  buffer. Watch the tension: a Flying Station's store pays for robots, and the Base's store
+  pays for quests — balance building robots against leveling up.
 - **The game is purely event-driven — do NOT use an `on.tick` polling loop.** Build around
   **`on.idle`**: it fires precisely when a robot needs a command. The golden rule: **every
   handler must issue the robot's next command** (fly / haul / `world.build` / `charge`), so a

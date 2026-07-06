@@ -1,261 +1,304 @@
-"""Robot City Builder — two-mine controller (Python).
+"""Robot City Builder — starter controller (Python).
 
-Goal of this controller: **build two mines — one ore, one metal — and have the
-robots haul from both to the Base until the level-1 Base quest is done** (the
-Base clears its level-1 quest by accumulating 40 ore + 20 metal, then levels up
-to 2).
+Robots start EMPTY. The ONLY way to shape the city is with the code below: it
+reacts to `idle` events (a robot is free) and hands each robot its next command.
 
-How it works, all driven off `idle` (the hook that fires whenever a robot is
-free):
+The economy in one breath:
+  * A pre-placed **Storage** next to the Base holds your starting capital
+    (30 ore / 15 metal). Robots `pick_up` from it to get build materials.
+  * **Mines** you build (place a site on a resource spot with
+    `world.build("mining", x, y)`, then `drop` its 6-ore / 3-metal cost onto the
+    site) auto-produce ore or metal. Robots `pick_up` from a mine and haul it off.
+  * The **Base** is the quest hub: `drop` ore/metal on it to fill the current
+    quest; meet it and the Base LEVELS UP to a harder one. Highest level = score.
+    You can't pick up from the Base; it doubles as a charging pad.
+  * A **Flying Station** (`world.build("flying_station", x, y)`) is a charging pad
+    AND a robot factory: stock it (drop ore/metal), then `station.build_robot(1)`.
+  * Flying burns ENERGY; `charge()` on any pad (Base or Flying Station). A robot
+    that runs dry mid-flight is destroyed — so `approach()` below never starts a
+    trip the robot can't finish and still reach a pad.
 
-1. **Build phase.** We want one mining building on a live *ore* spot and one on a
-   live *metal* spot. A mine's construction recipe is 6 ore + 3 metal — exactly
-   the kit each starting robot carries. So each kit-carrying robot is assigned
-   one still-missing mine: it flies to the spot, `world.build`s the site, and
-   `drop`s its kit to complete it. If the spot for its mine hasn't been revealed
-   yet, the robot flies into the fog to discover one first (flying reveals map).
-2. **Haul phase.** Once a mine is active, free robots ferry its output to the
-   Base: fly to the mine with the most stock of a resource the Base still needs,
-   `pick_up`, fly home, `drop`. Repeat until the Base reaches level 2.
-3. **Energy.** The Base doubles as a charging pad. Before every leg we keep a
-   margin big enough to fly home; when a robot can't, it returns and `charge`s so
-   it's never destroyed mid-flight.
-4. **Done.** When the Base hits level 2 the level-1 quest is complete, and robots
-   simply top up and stand by at the Base.
+Priority per idle robot:
+  1. energy guard    — get to a pad and charge before the battery dies,
+  2. place mines     — ensure an ore mine AND a metal mine exist,
+  3. fund sites      — carry materials to any half-built site (mine / station),
+  4. grow (once)     — after level 1, one robot builds a Flying Station + 1 robot,
+  5. haul the quest  — carry mine output to the Base to climb levels,
+  6. explore         — reveal the fog when there's nothing better to do.
+
+Persistent state lives in the durable, city-wide `store` and per-robot `memory`
+(never module globals — a code push hot-reloads this file and resets module scope).
 """
 
-from simcode import buildings, on, robots, world
+from simcode import buildings, on, robots, store, world
 
-WANT = ("ore", "metal")        # one mine of each resource type
-KIT_ORE, KIT_METAL = 6, 3      # mining construction recipe (per the game rules)
-SAFE_MARGIN = 14               # energy kept in reserve so a robot can always fly home
-EXPLORE_STEP = 6               # hop length when flying into the fog to find a spot
-DONE_LEVEL = 2                 # Base level once the level-1 quest is cleared
+MINE_KIT = (6, 3)       # ore, metal — the Mining recipe (what one mine costs)
+STATION_KIT = (4, 2)    # the Flying Station recipe
+ROBOT_COST = (12, 6)    # what a station spends from its store to build one robot
+CARRY = 10              # robot inventory capacity (ore + metal together)
+ENERGY_MARGIN = 20      # battery kept spare on top of any planned round trip
 
-WANT_ROBOTS = 2                # this goal needs two kit-carriers (one mine each)
-ROBOT_ORE, ROBOT_METAL = 12, 6 # Base robot-production recipe
-
-# Eight compass headings used to fan out exploration when a needed spot is still
-# hidden in the fog.
-DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (-1, -1), (1, -1)]
+# Compass headings for exploration; a robot advances one per trip so the fleet
+# fans out across the map instead of re-treading a single line.
+DIRS = [(1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1)]
 
 
-def _euclid(a, b):
-    dx, dy = a[0] - b[0], a[1] - b[1]
-    return (dx * dx + dy * dy) ** 0.5
+# --------------------------------------------------------------------------- #
+# small read-only helpers over the live world
+# --------------------------------------------------------------------------- #
+def dist(a, b):
+    return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
-def _has_kit(inv):
-    return inv.ore >= KIT_ORE and inv.metal >= KIT_METAL
+def charging_pads():
+    """Every cell a robot can `charge()` on: the Base + each active station."""
+    pads = [buildings.base.position] if buildings.base else []
+    return pads + [s.position for s in buildings.stations() if s.status == "active"]
 
 
-def _mines_by_resource():
-    """resource -> its mining building (active *or* under construction).
-
-    A mining building always reports the spot under it, so this classifies a mine
-    by resource even while the site is still being built.
-    """
-    out = {}
-    for b in buildings.of_type("mining"):
-        sp = b.spot
-        res = sp.resource if sp else None
-        if res and res not in out:
-            out[res] = b
-    return out
+def occupied_cells():
+    """Every cell covered by a building, so we never stack a new site on one."""
+    cells = set()
+    for b in buildings.all():
+        if not b.position:
+            continue
+        w, h = b.footprint
+        for dx in range(w):
+            for dy in range(h):
+                cells.add((b.position[0] + dx, b.position[1] + dy))
+    return cells
 
 
-def _taken_cells(mines):
-    return {tuple(b.position) for b in mines.values() if b.position is not None}
+def mine_resources():
+    """Resources we have a PRODUCTIVE mine for (built or under construction, spot
+    not yet exhausted). A mine whose spot has run dry no longer counts, so the
+    controller builds a fresh mine to replace it — the climb never hard-stalls."""
+    return {m.spot.resource for m in buildings.of_type("mining")
+            if m.spot and m.spot.resource and (m.spot.remaining or 0) > 0}
 
 
-def _nearest_spot(res, base_pos, taken):
-    """Nearest discovered, non-depleted spot of `res` we haven't already mined."""
-    best, best_d = None, None
+def free_spot(pos, resource):
+    """Nearest discovered, still-rich spot of `resource` with no building on it."""
+    occ = occupied_cells()
+    best = None
     for c in world.spots():
-        sp = c.spot
-        if not sp or sp.resource != res:
+        if not c.spot or c.spot.resource != resource or (c.spot.remaining or 0) <= 0:
             continue
-        remaining = sp.remaining
-        if remaining is not None and remaining <= 0:
+        if (c.x, c.y) in occ:
             continue
-        pos = c.position
-        if pos is None or tuple(pos) in taken:
-            continue
-        d = _euclid(pos, base_pos)
-        if best_d is None or d < best_d:
-            best, best_d = pos, d
+        if best is None or dist(pos, (c.x, c.y)) < dist(pos, best):
+            best = (c.x, c.y)
     return best
 
 
-def _pending_resources(mines):
-    """Resources whose mine is not yet ACTIVE (missing or still constructing)."""
-    return [res for res in WANT
-            if mines.get(res) is None or mines[res].status != "active"]
+def nearest_building(pos, kind, want=None):
+    """Nearest ACTIVE building of `kind`; `want(b)` may filter (e.g. has stock)."""
+    best = None
+    for b in buildings.of_type(kind):
+        if b.status != "active" or (want and not want(b)):
+            continue
+        if best is None or dist(pos, b.position) < dist(pos, best.position):
+            best = b
+    return best
 
 
-def _build_assignment(mines):
-    """Map kit-carrying robot id -> the mine resource it should build.
+def free_cell_near(center):
+    """A building-free cell a few steps from `center` (for a new Flying Station)."""
+    occ = occupied_cells()
+    for radius in (3, 4, 5, 6):
+        for dx, dy in DIRS:
+            cell = (center[0] + dx * radius, center[1] + dy * radius)
+            if cell not in occ:
+                return cell
+    return (center[0] + 3, center[1] + 3)
 
-    Only robots that actually carry a build kit can complete a mine, so we hand
-    each still-missing mine to one kit-carrier (stable order → deterministic).
-    """
-    pend = _pending_resources(mines)
-    kit_robots = sorted(r.id for r in robots.all() if _has_kit(r.inventory))
-    return {rid: res for rid, res in zip(kit_robots, pend)}
+
+# --------------------------------------------------------------------------- #
+# movement: fly toward a target, but charge first if we couldn't get home
+# --------------------------------------------------------------------------- #
+def approach(r, target):
+    """Fly `r` toward `target`, topping up energy first when the round trip would
+    strand it. Returns "arrived" when already on the target cell (the caller then
+    acts), or "moving" when a flight was issued (toward the target OR a pad)."""
+    target = (round(target[0]), round(target[1]))
+    if r.cell == target:
+        return "arrived"
+
+    pads = charging_pads()
+    if pads and r.energy is not None:
+        home = min(dist(target, p) for p in pads)                 # target -> nearest pad
+        if r.energy < dist(r.position, target) + home + ENERGY_MARGIN:
+            pad = min(pads, key=lambda p: dist(r.position, p))
+            if r.cell == pad:
+                r.charge()
+            else:
+                r.move_to(*pad)
+            return "moving"
+
+    r.move_to(target[0], target[1])
+    return "moving"
 
 
-def _explore(r, base_pos):
-    """Fly a fresh heading outward from the Base to reveal new ground."""
-    n = (r.memory.get("explore", 0) or 0) + 1
-    r.memory["explore"] = n
+def explore(r):
+    """Fly into the fog to reveal new ground; each trip picks a fresh heading."""
+    n = r.memory.get("trip", 0) + 1
+    r.memory["trip"] = n
     dx, dy = DIRS[(sum(map(ord, r.id)) + n) % len(DIRS)]
-    reach = EXPLORE_STEP * (1 + n // len(DIRS))
-    r.move_to(base_pos[0] + dx * reach, base_pos[1] + dy * reach)
-    r.log("exploring for a resource spot")
-    return True
+    x, y = r.position
+    approach(r, (x + dx * 6, y + dy * 6))
 
 
-def _try_build(r, res, mines, base_pos):
-    """Advance construction of the `res` mine. Returns True if a command issued."""
-    b = mines.get(res)
+# --------------------------------------------------------------------------- #
+# reusable jobs (each returns True when it has claimed this robot's turn)
+# --------------------------------------------------------------------------- #
+def fund_sites(r):
+    """Carry materials to the nearest half-built construction site (a mine or a
+    Flying Station). Empty robots fetch the exact recipe from Storage; loaded
+    robots drop what a site still needs. Sites self-complete once supplied."""
+    sites = [b for b in buildings.all() if b.status == "constructing" and b.construction]
+    if not sites:
+        return False
+    inv = r.inventory
 
-    # No site yet — need a live spot, then place the site and go supply it.
-    if b is None:
-        spot = _nearest_spot(res, base_pos, _taken_cells(mines))
-        if spot is None:
-            return _explore(r, base_pos)          # spot still in the fog
-        world.build("mining", int(spot[0]), int(spot[1]))
-        r.move_to(spot[0], spot[1])
-        r.log("placing %s mine at (%d, %d)" % (res, int(spot[0]), int(spot[1])))
+    if inv.ore or inv.metal:                       # loaded -> deliver to a site that wants it
+        target = None
+        for b in sites:
+            need_o = b.construction.required["ore"] - b.construction.delivered["ore"]
+            need_m = b.construction.required["metal"] - b.construction.delivered["metal"]
+            if (inv.ore and need_o > 0) or (inv.metal and need_m > 0):
+                if target is None or dist(r.position, b.position) < dist(r.position, target.position):
+                    target = b
+        if target is None:
+            return False                           # nothing here needs our load -> let haul use it
+        if approach(r, target.position) == "moving":
+            return True
+        r.drop()                                   # site takes only its recipe; excess stays with us
         return True
 
-    if b.status == "active":
-        return False                               # already built
-
-    # Site is under construction — deliver our kit if it still needs supply.
-    con = b.construction
-    reqd = con.required or {}
-    deld = con.delivered or {}
-    need_ore = reqd.get("ore", 0) - deld.get("ore", 0)
-    need_metal = reqd.get("metal", 0) - deld.get("metal", 0)
-    if need_ore <= 0 and need_metal <= 0:
-        return False                               # supplied; it self-completes
-
-    tp = b.position
-    if r.cell == (int(tp[0]), int(tp[1])):
-        r.drop()
-    else:
-        r.move_to(tp[0], tp[1])
+    # empty -> fetch the nearest site's remaining recipe from a stocked Storage
+    site = min(sites, key=lambda b: dist(r.position, b.position))
+    need_o = site.construction.required["ore"] - site.construction.delivered["ore"]
+    need_m = site.construction.required["metal"] - site.construction.delivered["metal"]
+    src = nearest_building(r.position, "storage",
+                           want=lambda b: b.storage.ore >= need_o and b.storage.metal >= need_m)
+    if src is None:
+        return False                               # Storage can't fund it yet -> do other work
+    if approach(r, src.position) == "moving":
+        return True
+    r.pick_up(need_o, need_m)
     return True
 
 
-def _maybe_grow_fleet(base):
-    """Self-recovery: this goal needs two kit-carrying robots (one per mine). If
-    the city is down to one, queue a second at the Base. Robot production waits
-    until the Base can pay (12 ore + 6 metal), so this is a no-op until there's a
-    surplus and it never starves an affordable quest of a robot's worth of goods.
-    The produced robot arrives with a fresh 6/3 kit — the second kit needed to
-    build the second mine.
-    """
-    if len(robots.all()) >= WANT_ROBOTS:
-        return
-    prod = base.production
-    if (prod.queued or 0) > 0 or prod.active:
-        return                                     # one is already on the way
-    base.build_robot(1)
+def haul(r, resource, target, amount):
+    """Pick up `resource` from the nearest stocked mine and drop it at `target`
+    (the Base quest or a station being stocked). Returns True while busy."""
+    have = r.inventory.ore if resource == "ore" else r.inventory.metal
+    if have > 0:
+        if approach(r, target) == "moving":
+            return True
+        r.drop(r.inventory.ore, r.inventory.metal)
+        return True
+    mine = nearest_building(r.position, "mining",
+                            want=lambda b: b.spot and b.spot.resource == resource
+                            and b.storage.ore + b.storage.metal > 0)
+    if mine is None:
+        return False
+    if approach(r, mine.position) == "moving":
+        return True
+    take = max(1, min(CARRY, amount))
+    r.pick_up(take, 0) if resource == "ore" else r.pick_up(0, take)
+    return True
 
 
-def _choose_haul_mine(mines, base):
-    """Pick the active mine to haul from: a resource the Base still needs, with
-    the most in stock (so we drain the fullest mine and avoid overflow)."""
-    quest = base.quest
-    reqd = quest.required or {}
-    prog = quest.progress or {}
-    need = {
-        "ore": max(0, reqd.get("ore", 40) - prog.get("ore", 0)),
-        "metal": max(0, reqd.get("metal", 20) - prog.get("metal", 0)),
-    }
-    best, best_stock = None, 0
-    for res in WANT:
-        if need[res] <= 0:
-            continue
-        b = mines.get(res)
-        if b is None or b.status != "active":
-            continue
-        stock = b.storage.ore + b.storage.metal
-        if stock > best_stock:
-            best, best_stock = b, stock
-    return best
+def grow(r, base):
+    """OPTIONAL fleet growth: after level 1, ONE robot (the 'grow lead') builds a
+    Flying Station, stocks it, and produces one extra robot. Everyone else keeps
+    feeding the quest, so growth never starves it. State is in the durable store."""
+    if (base.level or 1) < 2 or store.get("grow_done"):
+        return False
+    if store.get("grow_lead") is None:
+        store["grow_lead"] = r.id
+    if r.id != store.get("grow_lead"):
+        return False
+
+    stations = buildings.stations()
+    if not stations:
+        if not store.get("station_placed"):        # place the site once (fund_sites builds it)
+            site = free_cell_near(base.position)
+            world.build("flying_station", *site)
+            store["station_placed"] = True
+            r.log(f"growth: placing a Flying Station at {site}")
+        return False                               # let fund_sites/haul drive this robot
+    st = stations[0]
+    if st.status != "active":
+        return False                               # still under construction -> fund_sites handles it
+    if st.storage.ore >= ROBOT_COST[0] and st.storage.metal >= ROBOT_COST[1]:
+        st.build_robot(1)                          # stocked -> manufacture a robot
+        store["grow_done"] = True
+        r.log("growth: station stocked — building a new robot")
+        return True
+    want = "ore" if st.storage.ore < ROBOT_COST[0] else "metal"
+    need = ROBOT_COST[0] - st.storage.ore if want == "ore" else ROBOT_COST[1] - st.storage.metal
+    return haul(r, want, st.position, need)
 
 
+# --------------------------------------------------------------------------- #
+# the controller — one handler drives the whole fleet
+# --------------------------------------------------------------------------- #
 @on.idle
 def act(e):
     r = robots[e.robot_id]
     base = buildings.base
-    if base is None:
-        return
-    base_pos = base.position
-    base_cell = (int(base_pos[0]), int(base_pos[1]))
-    at_base = r.cell == base_cell
-    home_dist = _euclid(r.position, base_pos)
-
-    # 1) Energy: always keep enough to reach the Base; recharge there when low.
-    if r.energy is not None and r.energy <= home_dist + SAFE_MARGIN:
-        if at_base:
-            r.charge()
-        else:
-            r.log("low battery — returning to base to charge")
-            r.move_to(base_pos[0], base_pos[1])
+    if base is None or r.position is None:
         return
 
-    mines = _mines_by_resource()
+    # 1) ENERGY GUARD — if we're low and away from a pad, get to one and charge.
+    pads = charging_pads()
+    if pads and r.energy is not None:
+        pad = min(pads, key=lambda p: dist(r.position, p))
+        if r.energy <= dist(r.position, pad) + ENERGY_MARGIN:
+            r.charge() if r.cell == pad else r.move_to(*pad)
+            return
 
-    # 2) Objective reached — level-1 quest done. Deliver any cargo, then stand by.
-    if base.level >= DONE_LEVEL:
-        inv = r.inventory
-        if (inv.ore or inv.metal) and not at_base:
-            r.move_to(base_pos[0], base_pos[1])
-        elif inv.ore or inv.metal:
-            r.drop()
-        elif at_base and r.energy is not None and r.energy < 100:
-            r.charge()
-        else:
-            r.log("level-1 base complete — standing by")
+    # 2) PLACE MINES — make sure an ore mine AND a metal mine exist. Placing a
+    #    site is free and robot-independent; a later step funds it.
+    for res in ("ore", "metal"):
+        if res in mine_resources():
+            continue
+        spot = free_spot(r.position, res)
+        if spot:
+            world.build("mining", *spot)
+            r.log(f"placing a {res} mine at {spot}")
+            return
+        # No known spot for this resource yet -> we'll explore below to find one.
+
+    # 3) FUND SITES — carry materials to any half-built mine or station.
+    if fund_sites(r):
         return
 
-    # Self-recovery: keep the fleet at two kit-carriers so both mines can be
-    # built (queues a robot only when the Base can afford one).
-    _maybe_grow_fleet(base)
-
-    # 3) Build phase: if this robot is assigned a mine to build, work on it.
-    task = _build_assignment(mines).get(r.id)
-    if task and _try_build(r, task, mines, base_pos):
+    # 4) GROW (optional) — one robot expands the fleet once we're past level 1.
+    if grow(r, base):
         return
 
-    # 4) Haul phase: deliver cargo to the Base, else fetch from a needed mine.
+    # 5) HAUL THE QUEST — carry mine output to the Base to climb levels. Deliver
+    #    a carried load first, then pick up more of whatever the quest needs most.
+    req, prog = base.quest.required, base.quest.progress
+    need_o, need_m = req["ore"] - prog["ore"], req["metal"] - prog["metal"]
     inv = r.inventory
     if inv.ore or inv.metal:
-        if at_base:
+        if (inv.ore and need_o > 0) or (inv.metal and need_m > 0):
+            if approach(r, base.position) == "moving":
+                return
+            r.drop()                               # Base accepts up to the requirement
+            return
+        bank = nearest_building(r.position, "storage")   # Base wants none -> bank it for kits
+        if bank and approach(r, bank.position) != "moving":
             r.drop()
-        else:
-            r.move_to(base_pos[0], base_pos[1])
         return
+    for res in sorted(("ore", "metal"), key=lambda x: -(need_o if x == "ore" else need_m)):
+        need = need_o if res == "ore" else need_m
+        if need > 0 and haul(r, res, base.position, need):
+            return
 
-    mine = _choose_haul_mine(mines, base)
-    if mine is not None:
-        mp = mine.position
-        if r.cell == (int(mp[0]), int(mp[1])):
-            r.pick_up()
-        else:
-            r.move_to(mp[0], mp[1])
-        return
-
-    # 5) Nothing to haul yet (mines still filling / constructing) — wait at the
-    # Base, topping up so we're ready the moment there's stock to move.
-    if at_base:
-        if r.energy is not None and r.energy < 100:
-            r.charge()
-        else:
-            r.log("waiting for mines to fill")
-    else:
-        r.move_to(base_pos[0], base_pos[1])
+    # 6) Nothing useful to do -> explore and reveal more of the map.
+    explore(r)
