@@ -34,6 +34,9 @@ SAFE_MARGIN = 14               # energy kept in reserve so a robot can always fl
 EXPLORE_STEP = 6               # hop length when flying into the fog to find a spot
 DONE_LEVEL = 2                 # Base level once the level-1 quest is cleared
 
+WANT_ROBOTS = 2                # this goal needs two kit-carriers (one mine each)
+ROBOT_ORE, ROBOT_METAL = 12, 6 # Base robot-production recipe
+
 # Eight compass headings used to fan out exploration when a needed spot is still
 # hidden in the fog.
 DIRS = [(1, 0), (0, 1), (-1, 0), (0, -1), (1, 1), (-1, 1), (-1, -1), (1, -1)]
@@ -147,6 +150,22 @@ def _try_build(r, res, mines, base_pos):
     return True
 
 
+def _maybe_grow_fleet(base):
+    """Self-recovery: this goal needs two kit-carrying robots (one per mine). If
+    the city is down to one, queue a second at the Base. Robot production waits
+    until the Base can pay (12 ore + 6 metal), so this is a no-op until there's a
+    surplus and it never starves an affordable quest of a robot's worth of goods.
+    The produced robot arrives with a fresh 6/3 kit — the second kit needed to
+    build the second mine.
+    """
+    if len(robots.all()) >= WANT_ROBOTS:
+        return
+    prod = base.production
+    if (prod.queued or 0) > 0 or prod.active:
+        return                                     # one is already on the way
+    base.build_robot(1)
+
+
 def _choose_haul_mine(mines, base):
     """Pick the active mine to haul from: a resource the Base still needs, with
     the most in stock (so we drain the fullest mine and avoid overflow)."""
@@ -204,6 +223,10 @@ def act(e):
         else:
             r.log("level-1 base complete — standing by")
         return
+
+    # Self-recovery: keep the fleet at two kit-carriers so both mines can be
+    # built (queues a robot only when the Base can afford one).
+    _maybe_grow_fleet(base)
 
     # 3) Build phase: if this robot is assigned a mine to build, work on it.
     task = _build_assignment(mines).get(r.id)
