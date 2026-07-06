@@ -55,7 +55,13 @@ push after a local run looks right. See that repo's `CLAUDE.md` for full usage.
 
 Goal of the reference module: **raise the Base's level**. The Base sets a **quest** (an amount
 of ore + metal); deliver it and the Base **levels up** to a harder quest — endlessly. Your
-**highest Base level is your score.** The loop the starter implements:
+**highest Base level is your score.**
+
+> **This starter does NOT play the game.** It only keeps the robots alive and flies them
+> around to explore the map. Building the winning loop below is **your** job — that's the point
+> of a starter. Grow `main.py` from the bare explorer it ships with.
+
+The loop you'll build toward:
 
 ```
 pick up a kit from the starting Storage → fly to a resource spot →
